@@ -1,5 +1,6 @@
 ﻿.env
 .env.local
+!.env.example
 .env.*
 logs/
 __pycache__/

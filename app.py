@@ -128,6 +128,17 @@ def _default_api_key_for(provider: str) -> str:
     }.get(provider, "")
 
 
+def _default_model_for(provider: str) -> str:
+    """Pull the matching model name from .env / settings."""
+    return {
+        "gemini": settings.GEMINI_MODEL_NAME,
+        "groq": settings.GROQ_MODEL_NAME,
+        "openai": getattr(settings, "OPENAI_MODEL_NAME", "gpt-4o-mini"),
+        "deepseek": getattr(settings, "DEEPSEEK_MODEL_NAME", "deepseek-chat"),
+        "zhipuai": getattr(settings, "ZHIPUAI_MODEL_NAME", "glm-4-flash"),
+    }.get(provider, "")
+
+
 # ==================================================================
 # ORCHESTRATOR FACTORY (keyed cache)
 # ==================================================================
@@ -185,40 +196,16 @@ def main():
             "Provider",
             provider_names,
             index=current_idx,
-            help="Choose which LLM to use for intent classification & answer generation.",
+            help="Choose which LLM to use. Credentials are loaded from .env.",
         )
         selected_provider = PROVIDER_KEYS[selected_display]
 
-        # --- API Key ---
-        default_key = _default_api_key_for(selected_provider)
-        api_key_input = st.text_input(
-            f"{selected_display} API Key",
-            value=default_key,
-            type="password",
-            help="Loaded from .env by default. Override here for this session.",
-        )
-
-        # --- Model Name ---
-        default_model = DEFAULT_MODELS.get(selected_provider, "")
-        model_input = st.text_input(
-            "Model Name",
-            value=default_model,
-            help="Model identifier (e.g. gemini-2.0-flash, gpt-4o-mini).",
-        )
-
-        # --- Apply Button ---
-        config_changed = (
-            selected_provider != st.session_state.llm_provider
-            or api_key_input != st.session_state.api_key
-            or model_input != st.session_state.model_name
-        )
-
-        if config_changed:
-            if st.button("🔄 Apply New Configuration", type="primary", use_container_width=True):
-                st.session_state.llm_provider = selected_provider
-                st.session_state.api_key = api_key_input
-                st.session_state.model_name = model_input
-                st.rerun()
+        # Handle provider change immediately
+        if selected_provider != st.session_state.llm_provider:
+            st.session_state.llm_provider = selected_provider
+            st.session_state.api_key = _default_api_key_for(selected_provider)
+            st.session_state.model_name = _default_model_for(selected_provider)
+            st.rerun()
 
         st.divider()
 
@@ -255,7 +242,7 @@ def main():
         st.markdown(f"**Model:** `{st.session_state.model_name}`")
         st.markdown(f"**Engine:** `{selected_engine}`")
         st.markdown(f"**Environment:** `{settings.APP_ENV}`")
-        st.caption(f"API Key: {'••••' + st.session_state.api_key[-4:] if len(st.session_state.api_key) > 4 else '(not set)'}")
+        st.info("💡 Credentials are loaded from .env")
 
     # ------------------------------------------------------------------
     # Init Orchestrator

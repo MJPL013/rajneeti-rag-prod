@@ -6,7 +6,7 @@ load_dotenv()
 
 class Settings(BaseSettings):
     # --- Environment ---
-    APP_ENV: str = "local"  # "local" | "aws"
+    APP_ENV: str = "aws"  # "local" | "aws"
 
     # --- Project Paths (overridden by env vars for absolute paths) ---
     BASE_DIR: Path = Path(__file__).parent.parent.parent
@@ -33,8 +33,8 @@ class Settings(BaseSettings):
     LLM_MODEL_NAME: str = "llama3.2"  # Ollama model name
 
     # --- Feature Flags ---
-    ENABLE_GRAPH_RAG: bool = False
-    ENABLE_VECTOR_RAG: bool = True
+    ENABLE_GRAPH_RAG: bool = True
+    ENABLE_VECTOR_RAG: bool = False
 
     # --- Graph Database (Neo4j Aura) ---
     NEO4J_URI: str = ""

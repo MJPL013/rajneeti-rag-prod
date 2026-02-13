@@ -1,3 +1,12 @@
+"""
+Rajneeti RAG — Streamlit Frontend (Intent-Driven).
+
+Supports:
+  - Engine toggle: VectorRAG (ChromaDB) / GraphRAG (Neo4j)
+  - Intent display when GraphRAG is active
+  - Source cards with context from intent pipeline
+"""
+
 import streamlit as st
 import sys
 from pathlib import Path
@@ -18,13 +27,13 @@ def get_orchestrator():
 
 
 def main():
-    st.title("🗳️ Rajneeti RAG: Political News Analysis")
+    st.title("Rajneeti RAG: Political News Analysis")
 
     # --- Initialize orchestrator ---
     try:
         orchestrator = get_orchestrator()
     except Exception as e:
-        st.error(f"⚠️ Failed to initialize RAG system: {e}")
+        st.error(f"Failed to initialize RAG system: {e}")
         st.stop()
 
     # ------------------------------------------------------------------
@@ -32,7 +41,7 @@ def main():
     # ------------------------------------------------------------------
     st.sidebar.header("Configuration")
 
-    # 1. Backend Engine Selection (driven by feature flags)
+    # 1. Backend Engine Selection
     engine_options = []
     engine_keys = []
     if settings.ENABLE_VECTOR_RAG:
@@ -44,14 +53,14 @@ def main():
 
     if len(engine_options) > 1:
         selected_idx = st.sidebar.radio(
-            "🔧 Backend Engine",
+            "Backend Engine",
             range(len(engine_options)),
             format_func=lambda i: engine_options[i],
             help="Choose which database to query for retrieval.",
         )
         selected_engine = engine_keys[selected_idx]
     else:
-        st.sidebar.info(f"🔧 Engine: {engine_options[0]}")
+        st.sidebar.info(f"Engine: {engine_options[0]}")
         selected_engine = engine_keys[0]
 
     # 2. Politician Selector
@@ -70,9 +79,9 @@ def main():
 
     st.sidebar.divider()
 
-    # 4. LLM Info (read-only, from settings)
-    st.sidebar.markdown(f"🤖 **LLM Provider:** `{orchestrator.llm_backend}`")
-    st.sidebar.markdown(f"🌐 **Environment:** `{settings.APP_ENV}`")
+    # 4. Info
+    st.sidebar.markdown(f"**LLM Provider:** `{orchestrator.llm_backend}`")
+    st.sidebar.markdown(f"**Environment:** `{settings.APP_ENV}`")
 
     # ------------------------------------------------------------------
     # Chat Interface
@@ -92,41 +101,67 @@ def main():
 
         # Assistant Response
         with st.chat_message("assistant"):
-            st.caption(f"🤖 {orchestrator.llm_backend.upper()} | 🔧 {selected_engine}")
+            st.caption(f"LLM: {orchestrator.llm_backend.upper()} | Engine: {selected_engine}")
 
             # Prepare filters
             filters = {}
             if filter_mode != "All":
                 filters["classification"] = filter_mode
 
-            with st.spinner("Retrieving & Analyzing..."):
+            with st.spinner("Classifying intent & retrieving..."):
                 result = orchestrator.query(
                     query=prompt,
                     filters=filters,
                     engine=selected_engine,
                 )
 
-                sources = result["sources"]
+                sources = result.get("sources", [])
                 answer = result["answer"]
+                intent = result.get("intent", None)
+                analysis = result.get("analysis", None)
+
+                # Intent badge (only for graph engine)
+                if intent:
+                    intent_colors = {
+                        "TEMPORAL_EVOLUTION": "blue",
+                        "MEDIA_CONTRAST": "orange",
+                        "PERSONA": "violet",
+                        "FACTUAL": "green",
+                    }
+                    color = intent_colors.get(intent, "gray")
+                    st.markdown(f"**Detected Intent:** :{color}[{intent}]")
+
+                    if analysis:
+                        cols = st.columns(3)
+                        with cols[0]:
+                            st.markdown(f"**Politician:** `{analysis.get('politician', 'N/A')}`")
+                        with cols[1]:
+                            st.markdown(f"**Topics:** `{', '.join(analysis.get('topic_keywords', []))}`")
+                        with cols[2]:
+                            leaning = analysis.get('source_leaning') or 'All'
+                            st.markdown(f"**Media Filter:** `{leaning}`")
 
                 if not sources:
                     st.warning("No relevant statements found.")
                 else:
-                    # Display Sources (Expandable)
-                    with st.expander("View Retrieved Sources", expanded=False):
+                    with st.expander(f"View Retrieved Sources ({len(sources)})", expanded=False):
                         for res in sources:
-                            meta = res["metadata"]
-                            score = res["score"]
-                            st.markdown(
-                                f"**{meta.get('title', 'Unknown')}** (Score: {score:.4f})"
-                            )
-                            st.caption(
-                                f"Source: {meta.get('source')} | Date: {meta.get('publish_date')}"
-                            )
-                            st.markdown(f"> {res['document']}")
-                            st.markdown(
-                                f"[Read Article]({meta.get('url')}) | ID: `{meta.get('article_id')}`"
-                            )
+                            meta = res.get("metadata", {})
+                            score = res.get("score", 0.0)
+
+                            doc_text = res.get("document", "")
+                            title = meta.get("title", meta.get("year_month", ""))
+                            source_name = meta.get("source", meta.get("sources", ""))
+                            date = meta.get("publish_date", meta.get("year_month", ""))
+
+                            if title:
+                                st.markdown(f"**{title}** (Score: {score:.4f})")
+                            st.caption(f"Source: {source_name} | Date: {date}")
+                            st.markdown(f"> {doc_text[:300]}...")
+
+                            url = meta.get("url")
+                            if url:
+                                st.markdown(f"[Read Article]({url})")
                             st.divider()
 
                 st.markdown(answer)

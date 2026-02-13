@@ -11,3 +11,4 @@ pydantic-settings
 python-dotenv
 google-generativeai
 neo4j
+tqdm

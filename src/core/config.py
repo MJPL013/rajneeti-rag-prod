@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     RERANKING_MODEL_NAME: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
     # --- LLM Provider Selection ---
-    LLM_PROVIDER: str = "gemini"  # "gemini" | "groq" | "ollama"
+    LLM_PROVIDER: str = "gemini"  # "gemini" | "groq" | "openai" | "deepseek" | "zhipuai"
 
     # --- Gemini ---
     GEMINI_API_KEY: str = ""
@@ -27,6 +27,18 @@ class Settings(BaseSettings):
     # --- Groq ---
     GROQ_API_KEY: str = ""
     GROQ_MODEL_NAME: str = "openai/gpt-oss-120b"
+
+    # --- OpenAI ---
+    OPENAI_API_KEY: str = ""
+    OPENAI_MODEL_NAME: str = "gpt-4o-mini"
+
+    # --- DeepSeek ---
+    DEEPSEEK_API_KEY: str = ""
+    DEEPSEEK_MODEL_NAME: str = "deepseek-chat"
+
+    # --- ZhipuAI / GLM ---
+    ZHIPUAI_API_KEY: str = ""
+    ZHIPUAI_MODEL_NAME: str = "glm-4-flash"
 
     # --- Ollama ---
     OLLAMA_BASE_URL: str = "http://localhost:11434"

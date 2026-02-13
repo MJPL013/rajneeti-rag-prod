@@ -249,6 +249,9 @@ class Generator:
         model_map = {
             "gemini": settings.GEMINI_MODEL_NAME,
             "groq": settings.GROQ_MODEL_NAME,
+            "openai": getattr(settings, "OPENAI_MODEL_NAME", DEFAULT_MODELS.get("openai", "")),
+            "deepseek": getattr(settings, "DEEPSEEK_MODEL_NAME", DEFAULT_MODELS.get("deepseek", "")),
+            "zhipuai": getattr(settings, "ZHIPUAI_MODEL_NAME", DEFAULT_MODELS.get("zhipuai", "")),
         }
         return model_map.get(provider, DEFAULT_MODELS.get(provider, ""))
 

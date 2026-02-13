@@ -1,5 +1,5 @@
 """
-RAG Orchestrator — Intent-Driven Router.
+RAG Orchestrator — Intent-Driven Router (Dynamic Config).
 
 Pipeline:
   1. Intent Classification  : LLM classifies query -> (intent, entities, filters)
@@ -8,10 +8,9 @@ Pipeline:
   4. Generation             : Format RAGContext -> intent-specific prompt -> LLM answer
   5. Response Assembly      : Return structured RAGResponse
 
-Backwards-Compatible:
-  - VectorRAG (ChromaDB) still works via the old `query()` API when
-    ENABLE_VECTOR_RAG=True and ENABLE_GRAPH_RAG=False.
-  - The new intent pipeline activates when ENABLE_GRAPH_RAG=True.
+Dynamic Config:
+  - Accepts llm_provider / api_key / model_name overrides at construction.
+  - Streamlit creates a new Orchestrator when the user changes provider.
 """
 
 import json
@@ -68,15 +67,22 @@ USER QUERY: {query}
 
 class RAGOrchestrator:
     """
-    Central orchestrator — routes between VectorRAG (legacy) and
-    the new Intent-Driven GraphRAG pipeline.
+    Central orchestrator.
+
+    Accepts optional llm_provider / api_key / model_name at init time
+    to allow the Streamlit sidebar to override the .env defaults.
     """
 
-    def __init__(self):
-        logger.info("Initializing RAG Orchestrator (Intent-Driven)...")
+    def __init__(
+        self,
+        llm_provider: Optional[str] = None,
+        api_key: Optional[str] = None,
+        model_name: Optional[str] = None,
+    ):
+        logger.info("Initializing RAG Orchestrator (Dynamic Config)...")
         logger.info(f"  ENABLE_VECTOR_RAG = {settings.ENABLE_VECTOR_RAG}")
         logger.info(f"  ENABLE_GRAPH_RAG  = {settings.ENABLE_GRAPH_RAG}")
-        logger.info(f"  LLM_PROVIDER      = {settings.LLM_PROVIDER}")
+        logger.info(f"  LLM_PROVIDER      = {llm_provider or settings.LLM_PROVIDER}")
 
         if not settings.ENABLE_VECTOR_RAG and not settings.ENABLE_GRAPH_RAG:
             raise ConfigurationError(
@@ -93,12 +99,13 @@ class RAGOrchestrator:
         if settings.ENABLE_GRAPH_RAG:
             self._graph_engine = self._init_graph_engine()
 
-        self._generator = self._init_generator()
+        # Generator — uses overrides if provided, else falls back to settings
+        self._generator = self._init_generator(llm_provider, api_key, model_name)
 
         logger.info("RAG Orchestrator ready.")
 
     # ------------------------------------------------------------------
-    # Lazy initializers
+    # Initializers
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -112,9 +119,17 @@ class RAGOrchestrator:
         return GraphRAGEngine()
 
     @staticmethod
-    def _init_generator():
+    def _init_generator(
+        llm_provider: Optional[str] = None,
+        api_key: Optional[str] = None,
+        model_name: Optional[str] = None,
+    ):
         from src.rag.generator import Generator
-        return Generator()
+        return Generator(
+            llm_provider=llm_provider,
+            api_key=api_key,
+            model_name=model_name,
+        )
 
     # ------------------------------------------------------------------
     # Properties
@@ -133,6 +148,10 @@ class RAGOrchestrator:
     def llm_backend(self) -> str:
         return self._generator.get_backend_name()
 
+    @property
+    def llm_model(self) -> str:
+        return self._generator.get_model_name()
+
     # ------------------------------------------------------------------
     # PUBLIC API
     # ------------------------------------------------------------------
@@ -147,13 +166,10 @@ class RAGOrchestrator:
         Execute a RAG query.
 
         Routing Logic:
-          - engine="graph" (or ENABLE_GRAPH_RAG only) -> Intent-Driven Pipeline
-          - engine="vector"                           -> Legacy VectorRAG
-          - engine=None, both enabled                 -> Prefer Graph
-
-        Returns dict compatible with the Streamlit frontend.
+          - engine="graph" -> Intent-Driven Pipeline
+          - engine="vector" -> Legacy VectorRAG
+          - engine=None     -> Prefer Graph if available
         """
-        # Determine which path to take
         use_graph = False
         if engine == "graph" and self._graph_engine:
             use_graph = True
@@ -168,17 +184,10 @@ class RAGOrchestrator:
             return self._legacy_vector_pipeline(query, filters)
 
     # ------------------------------------------------------------------
-    # INTENT-DRIVEN PIPELINE (New)
+    # INTENT-DRIVEN PIPELINE
     # ------------------------------------------------------------------
 
     def _intent_pipeline(self, query: str, filters: Dict[str, Any] = None) -> Dict[str, Any]:
-        """
-        Full intent-driven pipeline:
-          1. Classify intent
-          2. Vector grounding
-          3. Graph traversal (by intent)
-          4. LLM generation (by intent)
-        """
         # Step 1: Intent Classification
         analysis = self._classify_intent(query)
         logger.info(
@@ -206,7 +215,6 @@ class RAGOrchestrator:
         context.topic = " ".join(analysis.topic_keywords) if analysis.topic_keywords else query
         answer = self._generator.generate_intent_answer(query, context)
 
-        # Build sources list for frontend
         sources = self._extract_sources(context)
 
         return {
@@ -225,25 +233,18 @@ class RAGOrchestrator:
         }
 
     def _classify_intent(self, query: str) -> QueryAnalysis:
-        """
-        Uses the configured LLM to classify user intent.
-        Falls back to FACTUAL on parse error.
-        """
         prompt = INTENT_CLASSIFIER_PROMPT.format(query=query)
 
         try:
             raw_response = self._generator._call_llm(prompt)
 
-            # Clean markdown fences if LLM wraps in ```json ... ```
             cleaned = raw_response.strip()
             if cleaned.startswith("```"):
-                # Remove first and last lines (```json and ```)
                 lines = cleaned.split("\n")
                 cleaned = "\n".join(lines[1:-1])
 
             parsed = json.loads(cleaned)
 
-            # Map intent string to enum
             intent_str = parsed.get("intent", "FACTUAL").upper()
             try:
                 intent = RAGIntent(intent_str)
@@ -270,30 +271,23 @@ class RAGOrchestrator:
         query: str,
         filters: Dict[str, Any] = None,
     ) -> RAGContext:
-        """Route to the correct GraphEngine traversal strategy."""
-
         intent = analysis.intent
         politician = analysis.politician
 
         if intent == RAGIntent.TEMPORAL_EVOLUTION and politician:
             return self._graph_engine.get_temporal_evolution(politician, grounded_ids)
-
         elif intent == RAGIntent.MEDIA_CONTRAST and politician:
             return self._graph_engine.get_media_portrayal(politician, grounded_ids)
-
         elif intent == RAGIntent.PERSONA and politician:
             return self._graph_engine.get_politician_persona(politician, grounded_ids)
-
         else:
-            # FACTUAL or missing politician -> flat retrieval
             return self._graph_engine.get_factual_context(query, politician, filters)
 
     # ------------------------------------------------------------------
-    # LEGACY VECTOR PIPELINE (Preserved)
+    # LEGACY VECTOR PIPELINE
     # ------------------------------------------------------------------
 
     def _legacy_vector_pipeline(self, query: str, filters: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Original VectorRAG path — unchanged logic."""
         logger.info("Querying with engine: vector")
         results = self._vector_engine.retrieve(query, filters=filters)
 
@@ -330,7 +324,6 @@ class RAGOrchestrator:
 
     @staticmethod
     def _extract_sources(ctx: RAGContext) -> List[Dict[str, Any]]:
-        """Build a sources list for the frontend from RAGContext."""
         sources = []
 
         if ctx.flat_statements:

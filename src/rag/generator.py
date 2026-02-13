@@ -1,66 +1,19 @@
 """
-Generator — Intent-Driven LLM Synthesis.
+Generator — Intent-Driven LLM Synthesis (Multi-Provider).
 
-Architecture:
-  - Maintains the unified multi-provider abstraction (Gemini / Groq / Ollama).
-  - Adds intent-specific prompt templates that produce structured,
-    analytical answers instead of generic summaries.
+Supports dynamic provider switching at runtime:
+  Gemini | Groq | OpenAI | DeepSeek | ZhipuAI (GLM)
 
-Prompt Strategy Mapping:
-  TEMPORAL_EVOLUTION  -> chronological stance trace
-  MEDIA_CONTRAST      -> left vs center vs right comparison table
-  PERSONA             -> rhetoric & promise analysis
-  FACTUAL             -> standard Q&A with citations
+No longer a singleton — each instance owns its own LLM connection,
+allowing the Streamlit frontend to swap providers via session state.
 """
+
+from typing import Optional
 
 from src.core.config import settings
 from src.core.logger import logger
 from src.core.exceptions import LLMGenerationError, ConfigurationError
 from src.models.schema import RAGIntent, RAGContext
-
-# --- Lazy imports for optional providers ---
-_genai = None
-_ChatGroq = None
-_ChatOllama = None
-
-
-def _get_genai():
-    global _genai
-    if _genai is None:
-        try:
-            import google.generativeai as genai
-            _genai = genai
-        except ImportError:
-            raise ConfigurationError(
-                "google-generativeai is not installed. Run: pip install google-generativeai"
-            )
-    return _genai
-
-
-def _get_chat_groq():
-    global _ChatGroq
-    if _ChatGroq is None:
-        try:
-            from langchain_groq import ChatGroq
-            _ChatGroq = ChatGroq
-        except ImportError:
-            raise ConfigurationError(
-                "langchain-groq is not installed. Run: pip install langchain-groq"
-            )
-    return _ChatGroq
-
-
-def _get_chat_ollama():
-    global _ChatOllama
-    if _ChatOllama is None:
-        try:
-            from langchain_community.chat_models import ChatOllama
-            _ChatOllama = ChatOllama
-        except ImportError:
-            raise ConfigurationError(
-                "langchain-community is not installed. Run: pip install langchain-community"
-            )
-    return _ChatOllama
 
 
 # ==================================================================
@@ -148,7 +101,6 @@ Question: {query}
 # ==================================================================
 
 def _format_temporal_context(ctx: RAGContext) -> str:
-    """Format timeline entries into a readable block."""
     lines = []
     for entry in ctx.timeline:
         lines.append(f"\n=== {entry.year_month} ===")
@@ -159,7 +111,6 @@ def _format_temporal_context(ctx: RAGContext) -> str:
 
 
 def _format_media_context(ctx: RAGContext) -> str:
-    """Format media groups into a readable block."""
     lines = []
     for group in ctx.media_groups:
         lines.append(f"\n--- {group.leaning.upper()} MEDIA ({', '.join(group.source_names)}) ---")
@@ -169,23 +120,19 @@ def _format_media_context(ctx: RAGContext) -> str:
 
 
 def _format_persona_context(ctx: RAGContext) -> str:
-    """Format persona statements into a readable block."""
     lines = []
     if ctx.rhetoric_statements:
         lines.append("\n--- RHETORIC (Politician's Own Voice) ---")
         for i, stmt in enumerate(ctx.rhetoric_statements, 1):
             lines.append(f"  [{i}] {stmt}")
-
     if ctx.high_weight_statements:
         lines.append("\n--- HIGH-WEIGHT STATEMENTS (Headlines / Major) ---")
         for i, stmt in enumerate(ctx.high_weight_statements, 1):
             lines.append(f"  [{i}] {stmt}")
-
     return "\n".join(lines) if lines else "No persona data available."
 
 
 def _format_factual_context(ctx: RAGContext) -> str:
-    """Format flat statement list into a readable block."""
     lines = []
     for i, stmt in enumerate(ctx.flat_statements, 1):
         lines.append(
@@ -206,84 +153,179 @@ CONTEXT_FORMATTERS = {
 
 
 # ==================================================================
-# GENERATOR CLASS
+# PROVIDER REGISTRY — maps provider key to (init_fn_name, generate_fn_name)
+# ==================================================================
+
+# Provider keys used in the sidebar dropdown and config
+SUPPORTED_PROVIDERS = [
+    "gemini",
+    "groq",
+    "openai",
+    "deepseek",
+    "zhipuai",
+]
+
+# Default models per provider
+DEFAULT_MODELS = {
+    "gemini": "gemini-2.0-flash",
+    "groq": "llama-3.3-70b-versatile",
+    "openai": "gpt-4o-mini",
+    "deepseek": "deepseek-chat",
+    "zhipuai": "glm-4-flash",
+}
+
+
+# ==================================================================
+# GENERATOR CLASS (No longer singleton)
 # ==================================================================
 
 class Generator:
     """
-    Singleton LLM Generator.
-    Backend is determined exclusively by settings.LLM_PROVIDER.
+    LLM Generator — one instance per provider configuration.
+    Accepts runtime overrides for provider, api_key, and model_name.
+    Falls back to settings.* defaults when overrides are not provided.
     """
-    _instance = None
 
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super(Generator, cls).__new__(cls)
-            cls._instance._initialize()
-        return cls._instance
+    def __init__(
+        self,
+        llm_provider: Optional[str] = None,
+        api_key: Optional[str] = None,
+        model_name: Optional[str] = None,
+    ):
+        # Resolve provider
+        self.backend = (llm_provider or settings.LLM_PROVIDER).lower().strip()
 
-    def _initialize(self):
-        provider = settings.LLM_PROVIDER.lower().strip()
-        logger.info(f"LLM Provider: {provider}")
+        # Resolve API key (provider-specific fallback from settings)
+        self.api_key = api_key or self._default_api_key(self.backend)
 
-        self.backend = provider
-        self._ollama_llm = None
+        # Resolve model name
+        self.model_name = model_name or self._default_model_name(self.backend)
+
+        logger.info(f"Generator init: provider={self.backend}, model={self.model_name}")
+
+        # LLM handles (only the active one will be set)
         self._gemini_model = None
         self._groq_llm = None
+        self._openai_client = None
+        self._deepseek_client = None
+        self._zhipuai_client = None
 
-        if provider == "gemini":
-            self._init_gemini()
-        elif provider == "groq":
-            self._init_groq()
-        elif provider == "ollama":
-            self._init_ollama()
-        else:
+        # Initialize the chosen provider
+        init_map = {
+            "gemini": self._init_gemini,
+            "groq": self._init_groq,
+            "openai": self._init_openai,
+            "deepseek": self._init_deepseek,
+            "zhipuai": self._init_zhipuai,
+        }
+
+        init_fn = init_map.get(self.backend)
+        if init_fn is None:
             raise ConfigurationError(
-                f"Unknown LLM_PROVIDER '{provider}'. Must be 'gemini', 'groq', or 'ollama'."
+                f"Unknown LLM provider '{self.backend}'. "
+                f"Supported: {', '.join(SUPPORTED_PROVIDERS)}"
             )
+        init_fn()
+
+    # ------------------------------------------------------------------
+    # Default resolution helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _default_api_key(provider: str) -> str:
+        """Pull the matching API key from settings / .env."""
+        key_map = {
+            "gemini": settings.GEMINI_API_KEY,
+            "groq": settings.GROQ_API_KEY,
+            "openai": getattr(settings, "OPENAI_API_KEY", ""),
+            "deepseek": getattr(settings, "DEEPSEEK_API_KEY", ""),
+            "zhipuai": getattr(settings, "ZHIPUAI_API_KEY", ""),
+        }
+        return key_map.get(provider, "")
+
+    @staticmethod
+    def _default_model_name(provider: str) -> str:
+        """Pull the matching model name from settings, else use DEFAULT_MODELS."""
+        model_map = {
+            "gemini": settings.GEMINI_MODEL_NAME,
+            "groq": settings.GROQ_MODEL_NAME,
+        }
+        return model_map.get(provider, DEFAULT_MODELS.get(provider, ""))
 
     # ------------------------------------------------------------------
     # Provider init methods
     # ------------------------------------------------------------------
 
     def _init_gemini(self):
-        if not settings.GEMINI_API_KEY:
-            raise ConfigurationError("GEMINI_API_KEY is required when LLM_PROVIDER='gemini'.")
-
-        genai = _get_genai()
+        if not self.api_key:
+            raise ConfigurationError("API key is required for Gemini.")
         try:
-            genai.configure(api_key=settings.GEMINI_API_KEY)
-            self._gemini_model = genai.GenerativeModel(settings.GEMINI_MODEL_NAME)
-            logger.info(f"Gemini initialized -- model: {settings.GEMINI_MODEL_NAME}")
+            import google.generativeai as genai
+            genai.configure(api_key=self.api_key)
+            self._gemini_model = genai.GenerativeModel(self.model_name)
+            logger.info(f"Gemini ready -> {self.model_name}")
+        except ImportError:
+            raise ConfigurationError("pip install google-generativeai")
         except Exception as e:
-            raise LLMGenerationError(f"Failed to initialize Gemini: {e}") from e
+            raise LLMGenerationError(f"Gemini init failed: {e}") from e
 
     def _init_groq(self):
-        if not settings.GROQ_API_KEY:
-            raise ConfigurationError("GROQ_API_KEY is required when LLM_PROVIDER='groq'.")
-
-        ChatGroq = _get_chat_groq()
+        if not self.api_key:
+            raise ConfigurationError("API key is required for Groq.")
         try:
+            from langchain_groq import ChatGroq
             self._groq_llm = ChatGroq(
-                groq_api_key=settings.GROQ_API_KEY,
-                model_name=settings.GROQ_MODEL_NAME,
+                groq_api_key=self.api_key,
+                model_name=self.model_name,
                 temperature=0.3,
             )
-            logger.info(f"Groq initialized -- model: {settings.GROQ_MODEL_NAME}")
+            logger.info(f"Groq ready -> {self.model_name}")
+        except ImportError:
+            raise ConfigurationError("pip install langchain-groq")
         except Exception as e:
-            raise LLMGenerationError(f"Failed to initialize Groq: {e}") from e
+            raise LLMGenerationError(f"Groq init failed: {e}") from e
 
-    def _init_ollama(self):
-        ChatOllama = _get_chat_ollama()
+    def _init_openai(self):
+        if not self.api_key:
+            raise ConfigurationError("API key is required for OpenAI.")
         try:
-            self._ollama_llm = ChatOllama(
-                base_url=settings.OLLAMA_BASE_URL,
-                model=settings.LLM_MODEL_NAME,
-                temperature=0.3,
-            )
-            logger.info(f"Ollama initialized -- model: {settings.LLM_MODEL_NAME} @ {settings.OLLAMA_BASE_URL}")
+            from openai import OpenAI
+            self._openai_client = OpenAI(api_key=self.api_key)
+            logger.info(f"OpenAI ready -> {self.model_name}")
+        except ImportError:
+            raise ConfigurationError("pip install openai")
         except Exception as e:
-            raise LLMGenerationError(f"Failed to initialize Ollama: {e}") from e
+            raise LLMGenerationError(f"OpenAI init failed: {e}") from e
+
+    def _init_deepseek(self):
+        if not self.api_key:
+            raise ConfigurationError("API key is required for DeepSeek.")
+        try:
+            from openai import OpenAI
+            self._deepseek_client = OpenAI(
+                api_key=self.api_key,
+                base_url="https://api.deepseek.com",
+            )
+            logger.info(f"DeepSeek ready -> {self.model_name}")
+        except ImportError:
+            raise ConfigurationError("pip install openai  (DeepSeek uses OpenAI-compatible API)")
+        except Exception as e:
+            raise LLMGenerationError(f"DeepSeek init failed: {e}") from e
+
+    def _init_zhipuai(self):
+        if not self.api_key:
+            raise ConfigurationError("API key is required for ZhipuAI/GLM.")
+        try:
+            from openai import OpenAI
+            self._zhipuai_client = OpenAI(
+                api_key=self.api_key,
+                base_url="https://open.bigmodel.cn/api/paas/v4",
+            )
+            logger.info(f"ZhipuAI/GLM ready -> {self.model_name}")
+        except ImportError:
+            raise ConfigurationError("pip install openai  (ZhipuAI uses OpenAI-compatible API)")
+        except Exception as e:
+            raise LLMGenerationError(f"ZhipuAI init failed: {e}") from e
 
     # ------------------------------------------------------------------
     # Public API
@@ -292,10 +334,11 @@ class Generator:
     def get_backend_name(self) -> str:
         return self.backend
 
+    def get_model_name(self) -> str:
+        return self.model_name
+
     def generate_answer(self, query: str, context: str) -> str:
-        """
-        Legacy API — plain string context (backwards-compatible).
-        """
+        """Legacy API — plain string context."""
         if not context:
             return "I could not find any relevant information to answer your question."
 
@@ -308,9 +351,7 @@ class Generator:
         return self._call_llm(prompt)
 
     def generate_intent_answer(self, query: str, context: RAGContext) -> str:
-        """
-        New API — accepts structured RAGContext, formats prompt by intent.
-        """
+        """New API — accepts structured RAGContext, formats prompt by intent."""
         if context.total_statements == 0:
             return "I could not find enough relevant information in the graph to answer your question."
 
@@ -329,23 +370,28 @@ class Generator:
         return self._call_llm(prompt)
 
     # ------------------------------------------------------------------
-    # Unified LLM call
+    # Unified LLM call — routes to the active backend
     # ------------------------------------------------------------------
 
     def _call_llm(self, prompt: str) -> str:
-        """Route to the active backend."""
-        if self.backend == "gemini":
-            return self._generate_gemini(prompt)
-        elif self.backend == "groq":
-            return self._generate_groq(prompt)
-        elif self.backend == "ollama":
-            return self._generate_ollama(prompt)
-        else:
+        dispatch = {
+            "gemini": self._generate_gemini,
+            "groq": self._generate_groq,
+            "openai": self._generate_openai,
+            "deepseek": self._generate_deepseek,
+            "zhipuai": self._generate_zhipuai,
+        }
+        fn = dispatch.get(self.backend)
+        if fn is None:
             raise LLMGenerationError(f"No LLM backend configured (provider={self.backend}).")
+        return fn(prompt)
+
+    # ------------------------------------------------------------------
+    # Provider-specific generation
+    # ------------------------------------------------------------------
 
     def _generate_gemini(self, prompt: str) -> str:
         try:
-            logger.info("Sending request to Gemini API...")
             response = self._gemini_model.generate_content(prompt)
             return response.text
         except Exception as e:
@@ -353,25 +399,46 @@ class Generator:
             raise LLMGenerationError(f"Gemini generation failed: {e}") from e
 
     def _generate_groq(self, prompt: str) -> str:
-        from langchain_core.messages import HumanMessage, SystemMessage
-
         try:
-            logger.info("Sending request to Groq...")
-            messages = [HumanMessage(content=prompt)]
-            response = self._groq_llm.invoke(messages)
+            from langchain_core.messages import HumanMessage
+            response = self._groq_llm.invoke([HumanMessage(content=prompt)])
             return response.content
         except Exception as e:
             logger.error(f"Groq generation failed: {e}")
             raise LLMGenerationError(f"Groq generation failed: {e}") from e
 
-    def _generate_ollama(self, prompt: str) -> str:
-        from langchain_core.messages import HumanMessage, SystemMessage
-
+    def _generate_openai(self, prompt: str) -> str:
         try:
-            logger.info("Sending request to Ollama...")
-            messages = [HumanMessage(content=prompt)]
-            response = self._ollama_llm.invoke(messages)
-            return response.content
+            response = self._openai_client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+            )
+            return response.choices[0].message.content
         except Exception as e:
-            logger.error(f"Ollama generation failed: {e}")
-            raise LLMGenerationError(f"Ollama generation failed: {e}") from e
+            logger.error(f"OpenAI generation failed: {e}")
+            raise LLMGenerationError(f"OpenAI generation failed: {e}") from e
+
+    def _generate_deepseek(self, prompt: str) -> str:
+        try:
+            response = self._deepseek_client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            logger.error(f"DeepSeek generation failed: {e}")
+            raise LLMGenerationError(f"DeepSeek generation failed: {e}") from e
+
+    def _generate_zhipuai(self, prompt: str) -> str:
+        try:
+            response = self._zhipuai_client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            logger.error(f"ZhipuAI generation failed: {e}")
+            raise LLMGenerationError(f"ZhipuAI generation failed: {e}") from e

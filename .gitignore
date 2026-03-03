@@ -1,0 +1,39 @@
+# =======================
+# Environment & Secrets
+# =======================
+.env
+
+# =======================
+# Python
+# =======================
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# =======================
+# Data (NEVER commit datasets)
+# =======================
+stage1_data_collection/raw_articles/*.json
+stage1_data_collection/gemini_outputs/*.json
+
+# =======================
+# Databases & Indexes
+# =======================
+vector_db/
+graph_db/
+*.db
+
+# =======================
+# Logs
+# =======================
+logs/
+*.log
+
+# =======================
+# OS
+# =======================
+.DS_Store
+Thumbs.db
